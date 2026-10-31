@@ -16,8 +16,10 @@
 
 #include <inttypes.h>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include "osrf_testing_tools_cpp/memory_tools/memory_tools.hpp"
 #include "osrf_testing_tools_cpp/scope_exit.hpp"
@@ -30,6 +32,61 @@ using osrf_testing_tools_cpp::memory_tools::on_unexpected_malloc;
 using osrf_testing_tools_cpp::memory_tools::on_unexpected_realloc;
 using osrf_testing_tools_cpp::memory_tools::on_unexpected_calloc;
 using osrf_testing_tools_cpp::memory_tools::on_unexpected_free;
+
+TEST(rcl_time, ros_override_flag_concurrent_readers) {
+  rcl_clock_t clock{};
+  rcl_allocator_t allocator = rcl_get_default_allocator();
+  ASSERT_EQ(RCL_RET_OK, rcl_ros_clock_init(&clock, &allocator));
+  OSRF_TESTING_TOOLS_CPP_SCOPE_EXIT(
+  {
+    EXPECT_EQ(RCL_RET_OK, rcl_ros_clock_fini(&clock));
+  });
+  constexpr size_t worker_count = 8;
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> ready{0};
+  std::atomic<size_t> failures{0};
+  std::atomic<size_t> reads{0};
+  std::vector<std::thread> readers;
+  for (size_t index = 0; index < worker_count; ++index) {
+    readers.emplace_back([&]() {
+        size_t count = 0;
+        do {
+          bool active = false;
+          rcl_time_point_value_t now = 0;
+          if (RCL_RET_OK != rcl_is_enabled_ros_time_override(&clock, &active)) {
+            failures.fetch_add(1);
+          }
+          if (RCL_RET_OK != rcl_clock_get_now(&clock, &now)) {
+            failures.fetch_add(1);
+          }
+          if (++count == 1) {
+            ready.fetch_add(1);
+          }
+        } while (!stop.load());
+        reads.fetch_add(count);
+      });
+  }
+  while (ready.load() < worker_count) {
+    std::this_thread::yield();
+  }
+  for (size_t index = 0; index < 4096; ++index) {
+    if (RCL_RET_OK != rcl_enable_ros_time_override(&clock)) {
+      failures.fetch_add(1);
+    }
+    if (RCL_RET_OK != rcl_set_ros_time_override(&clock, static_cast<int64_t>(index))) {
+      failures.fetch_add(1);
+    }
+    if (RCL_RET_OK != rcl_disable_ros_time_override(&clock)) {
+      failures.fetch_add(1);
+    }
+  }
+  stop.store(true);
+  for (auto & reader : readers) {
+    reader.join();
+  }
+  EXPECT_EQ(0u, failures.load());
+  EXPECT_GE(reads.load(), worker_count);
+}
 
 class TestTimeFixture : public ::testing::Test
 {

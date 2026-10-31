@@ -597,18 +597,13 @@ rcl_disable_ros_time_override(rcl_clock_t * clock);
  * time overide is enabled. If it is enabled, the set value will be returned.
  * Otherwise this time source will return the equivalent to system time abstraction.
  *
- * This function is not thread-safe with rcl_enable_ros_time_override() nor
- * rcl_disable_ros_time_override() functions when used on the same clock object.
- *
  * <hr>
  * Attribute          | Adherence
  * ------------------ | -------------
  * Allocates Memory   | No
- * Thread-Safe        | No [1]
- * Uses Atomics       | No
+ * Thread-Safe        | Yes
+ * Uses Atomics       | Yes
  * Lock-Free          | Yes
- *
- * <i>[1] Function is reentrant, but concurrent calls on the same `clock` object are not safe.</i>
  *
  * \param[in] clock The clock to query.
  * \param[out] is_enabled Whether the override is enabled..
