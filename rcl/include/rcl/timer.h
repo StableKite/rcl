@@ -146,12 +146,7 @@ rcl_get_zero_initialized_timer(void);
  * Allocates Memory   | Yes
  * Thread-Safe        | No
  * Uses Atomics       | Yes
- * Lock-Free          | Yes [1][2][3]
- * <i>[1] if `atomic_is_lock_free()` returns true for `atomic_uintptr_t`</i>
- *
- * <i>[2] if `atomic_is_lock_free()` returns true for `atomic_uint_least64_t`</i>
- *
- * <i>[3] if `atomic_is_lock_free()` returns true for `atomic_bool`</i>
+ * Lock-Free          | No
  *
  * \param[inout] timer the timer handle to be initialized
  * \param[in] clock the clock providing the current time
@@ -208,12 +203,7 @@ rcl_timer_init(
  * Allocates Memory   | Yes
  * Thread-Safe        | No
  * Uses Atomics       | Yes
- * Lock-Free          | Yes [1][2][3]
- * <i>[1] if `atomic_is_lock_free()` returns true for `atomic_uintptr_t`</i>
- *
- * <i>[2] if `atomic_is_lock_free()` returns true for `atomic_uint_least64_t`</i>
- *
- * <i>[3] if `atomic_is_lock_free()` returns true for `atomic_bool`</i>
+ * Lock-Free          | No
  *
  * \param[inout] timer the handle to the timer to be finalized.
  * \return #RCL_RET_OK if the timer was finalized successfully, or
@@ -612,6 +602,8 @@ rcl_timer_is_canceled(const rcl_timer_t * timer, bool * is_canceled);
  * This function can be called on a timer, canceled or not.
  * For all timers it will reset the last call time to now.
  * For canceled timers it will additionally make the timer not canceled.
+ * Reset notifications and callback replacement are serialized per timer.
+ * A callback may replace or clear itself on the same thread.
  *
  * <hr>
  * Attribute          | Adherence
@@ -619,8 +611,7 @@ rcl_timer_is_canceled(const rcl_timer_t * timer, bool * is_canceled);
  * Allocates Memory   | No
  * Thread-Safe        | Yes
  * Uses Atomics       | Yes
- * Lock-Free          | Yes [1]
- * <i>[1] if `atomic_is_lock_free()` returns true for `atomic_int_least64_t`</i>
+ * Lock-Free          | No
  *
  * \param[inout] timer the timer to be reset
  * \return #RCL_RET_OK if the timer was reset successfully, or
@@ -681,12 +672,16 @@ rcl_timer_get_guard_condition(const rcl_timer_t * timer);
  * This API sets the callback function to be called whenever the
  * timer is reset.
  * If the timer has already been reset, the callback will be called.
+ * The callback and user data are replaced together. Returning from this
+ * function drains any previous callback executing on another thread, so its
+ * user data can then be released. A callback may replace or clear itself;
+ * its current invocation must finish using its own user data before releasing it.
  *
  * <hr>
  * Attribute          | Adherence
  * ------------------ | -------------
  * Allocates Memory   | No
- * Thread-Safe        | No
+ * Thread-Safe        | Yes
  * Uses Atomics       | No
  * Lock-Free          | No
  *
@@ -694,7 +689,9 @@ rcl_timer_get_guard_condition(const rcl_timer_t * timer);
  * \param[in] on_reset_callback The callback to be called when timer is reset
  * \param[in] user_data Given to the callback when called later, may be NULL
  * \return `RCL_RET_OK` if successful, or
- * \return `RCL_RET_INVALID_ARGUMENT` if `timer` is NULL
+ * \return `RCL_RET_INVALID_ARGUMENT` if `timer` is NULL, or
+ * \return `RCL_RET_TIMER_INVALID` if the timer is uninitialized, or
+ * \return `RCL_RET_ERROR` if synchronization fails
  */
 RCL_PUBLIC
 RCL_WARN_UNUSED
