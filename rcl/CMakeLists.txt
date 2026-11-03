@@ -17,6 +17,7 @@ find_package(service_msgs REQUIRED)
 find_package(tracetools REQUIRED)
 find_package(type_description_interfaces REQUIRED)
 find_package(yaml REQUIRED)
+find_package(Threads REQUIRED)
 
 include(cmake/rcl_set_symbol_visibility_hidden.cmake)
 include(cmake/get_default_rcl_logging_implementation.cmake)
@@ -97,6 +98,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   ${type_description_interfaces_TARGETS}
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
+  Threads::Threads
   ${RCL_LOGGING_IMPL}::${RCL_LOGGING_IMPL}
   ${service_msgs_TARGETS}
   tracetools::tracetools

@@ -13,8 +13,12 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 #include "rcl/timer.h"
 
@@ -1082,4 +1086,198 @@ TEST_F(TestPreInitTimer, test_time_since_last_call) {
   std::this_thread::sleep_for(std::chrono::milliseconds(1));
   ASSERT_EQ(RCL_RET_OK, rcl_timer_get_time_since_last_call(&timer, &time_sice_next_call_end));
   EXPECT_GT(time_sice_next_call_end, time_sice_next_call_start);
+}
+
+namespace
+{
+struct ResetCount
+{
+  int tag;
+  std::atomic<size_t> * total;
+  std::atomic<size_t> * mismatches;
+};
+
+void count_reset_one(const void * user_data, size_t count)
+{
+  const auto & state = *static_cast<const ResetCount *>(user_data);
+  if (state.tag != 1) {
+    state.mismatches->fetch_add(1);
+  }
+  state.total->fetch_add(count);
+}
+
+void count_reset_two(const void * user_data, size_t count)
+{
+  const auto & state = *static_cast<const ResetCount *>(user_data);
+  if (state.tag != 2) {
+    state.mismatches->fetch_add(1);
+  }
+  state.total->fetch_add(count);
+}
+}  // namespace
+
+TEST_F(TestPreInitTimer, reset_callback_pending_count_is_not_lost_on_reentry)
+{
+  ASSERT_EQ(RCL_RET_OK, rcl_timer_reset(&timer));
+  struct ReentrantReset
+  {
+    rcl_timer_t * timer;
+    rcl_ret_t clear_result = RCL_RET_ERROR;
+    rcl_ret_t reset_result = RCL_RET_ERROR;
+    size_t notifications = 0;
+  } state{&timer};
+  const auto callback = [](const void * data, size_t count) {
+      auto & state = *const_cast<ReentrantReset *>(static_cast<const ReentrantReset *>(data));
+      state.notifications += count;
+      state.clear_result = rcl_timer_set_on_reset_callback(state.timer, nullptr, nullptr);
+      state.reset_result = rcl_timer_reset(state.timer);
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, callback, &state));
+  EXPECT_EQ(RCL_RET_OK, state.clear_result);
+  EXPECT_EQ(RCL_RET_OK, state.reset_result);
+  EXPECT_EQ(1u, state.notifications);
+  std::atomic<size_t> total{0};
+  std::atomic<size_t> mismatches{0};
+  const ResetCount counter{1, &total, &mismatches};
+  ASSERT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, count_reset_one, &counter));
+  EXPECT_EQ(1u, total.load());
+  EXPECT_EQ(0u, mismatches.load());
+  EXPECT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, nullptr, nullptr));
+}
+
+TEST_F(TestPreInitTimer, concurrent_resets_preserve_every_pending_notification)
+{
+  std::atomic<size_t> errors{0};
+  std::vector<std::thread> workers;
+  for (size_t worker = 0; worker < 8; ++worker) {
+    workers.emplace_back([&]() {
+        for (size_t round = 0; round < 512; ++round) {
+          if (RCL_RET_OK != rcl_timer_reset(&timer)) {
+            errors.fetch_add(1);
+          }
+        }
+      });
+  }
+  for (auto & worker : workers) {
+    worker.join();
+  }
+  std::atomic<size_t> total{0};
+  std::atomic<size_t> mismatches{0};
+  const ResetCount counter{1, &total, &mismatches};
+  ASSERT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, count_reset_one, &counter));
+  EXPECT_EQ(0u, errors.load());
+  EXPECT_EQ(4096u, total.load());
+  EXPECT_EQ(0u, mismatches.load());
+  EXPECT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, nullptr, nullptr));
+}
+
+TEST_F(TestPreInitTimer, concurrent_reset_callback_replacement_preserves_userdata_pair)
+{
+  std::atomic<size_t> total{0};
+  std::atomic<size_t> mismatches{0};
+  std::atomic<size_t> errors{0};
+  const ResetCount first{1, &total, &mismatches};
+  const ResetCount second{2, &total, &mismatches};
+  ASSERT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, count_reset_one, &first));
+  std::atomic<bool> start{false};
+  std::atomic<size_t> ready{0};
+  std::vector<std::thread> workers;
+  for (size_t worker = 0; worker < 8; ++worker) {
+    workers.emplace_back([&, worker]() {
+        ready.fetch_add(1);
+        while (!start.load()) {
+          std::this_thread::yield();
+        }
+        for (size_t round = 0; round < 2048; ++round) {
+          rcl_ret_t ret;
+          if (worker < 4) {
+            ret = rcl_timer_reset(&timer);
+          } else if ((worker + round) % 2 == 0) {
+            ret = rcl_timer_set_on_reset_callback(&timer, count_reset_one, &first);
+          } else {
+            ret = rcl_timer_set_on_reset_callback(&timer, count_reset_two, &second);
+          }
+          if (ret != RCL_RET_OK) {
+            errors.fetch_add(1);
+          }
+        }
+      });
+  }
+  while (ready.load() != 8) {
+    std::this_thread::yield();
+  }
+  start.store(true);
+  for (auto & worker : workers) {
+    worker.join();
+  }
+  EXPECT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, nullptr, nullptr));
+  EXPECT_EQ(0u, errors.load());
+  EXPECT_EQ(0u, mismatches.load());
+  EXPECT_EQ(8192u, total.load());
+}
+
+TEST_F(TestPreInitTimer, removing_reset_callback_waits_for_its_inflight_userdata)
+{
+  struct BlockingReset
+  {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool released = false;
+    bool callback_timed_out = false;
+    std::atomic<bool> removing{false};
+    std::atomic<bool> removed{false};
+  } state;
+  const auto callback = [](const void * data, size_t) {
+      auto & state = *const_cast<BlockingReset *>(static_cast<const BlockingReset *>(data));
+      std::unique_lock<std::mutex> lock(state.mutex);
+      state.entered = true;
+      state.cv.notify_all();
+      if (!state.cv.wait_for(lock, std::chrono::seconds(5), [&]() {return state.released;})) {
+        state.callback_timed_out = true;
+      }
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_timer_set_on_reset_callback(&timer, callback, &state));
+  rcl_ret_t reset_result = RCL_RET_ERROR;
+  rcl_ret_t remove_result = RCL_RET_ERROR;
+  std::thread resetter([&]() {reset_result = rcl_timer_reset(&timer);});
+  bool entered;
+  {
+    std::unique_lock<std::mutex> lock(state.mutex);
+    entered = state.cv.wait_for(lock, std::chrono::seconds(5), [&]() {return state.entered;});
+  }
+  std::thread remover([&]() {
+      state.removing.store(true);
+      state.cv.notify_all();
+      remove_result = rcl_timer_set_on_reset_callback(&timer, nullptr, nullptr);
+      state.removed.store(true);
+      state.cv.notify_all();
+    });
+  bool removing;
+  bool removed_early;
+  {
+    std::unique_lock<std::mutex> lock(state.mutex);
+    removing = state.cv.wait_for(lock, std::chrono::seconds(5), [&]() {return state.removing.load();});
+    removed_early = state.cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {return state.removed.load();});
+    state.released = true;
+    state.cv.notify_all();
+  }
+  resetter.join();
+  remover.join();
+  EXPECT_TRUE(entered);
+  EXPECT_TRUE(removing);
+  EXPECT_FALSE(removed_early);
+  EXPECT_FALSE(state.callback_timed_out);
+  EXPECT_TRUE(state.removed.load());
+  EXPECT_EQ(RCL_RET_OK, reset_result);
+  EXPECT_EQ(RCL_RET_OK, remove_result);
+}
+
+TEST_F(TestTimerFixture, reset_callback_rejects_uninitialized_timer)
+{
+  const rcl_timer_t uninitialized = rcl_get_zero_initialized_timer();
+  EXPECT_EQ(RCL_RET_TIMER_INVALID, rcl_timer_set_on_reset_callback(&uninitialized, nullptr, nullptr));
+  rcl_reset_error();
+  EXPECT_EQ(RCL_RET_INVALID_ARGUMENT, rcl_timer_set_on_reset_callback(nullptr, nullptr, nullptr));
+  rcl_reset_error();
 }

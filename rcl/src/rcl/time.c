@@ -28,7 +28,7 @@
 typedef struct rcl_ros_clock_storage_s
 {
   atomic_uint_least64_t current_time;
-  bool active;
+  atomic_bool active;
 } rcl_ros_clock_storage_t;
 
 // Implementation only
@@ -65,7 +65,7 @@ static rcl_ret_t
 rcl_get_ros_time(void * data, rcl_time_point_value_t * current_time)
 {
   rcl_ros_clock_storage_t * t = (rcl_ros_clock_storage_t *)data;
-  if (!t->active) {
+  if (!rcutils_atomic_load_bool(&(t->active))) {
     return rcl_get_system_time(data, current_time);
   }
   *current_time = rcutils_atomic_load_uint64_t(&(t->current_time));
@@ -166,7 +166,7 @@ rcl_ros_clock_init(
   rcl_ros_clock_storage_t * storage = (rcl_ros_clock_storage_t *)clock->data;
   // 0 is a special value meaning time has not been set
   atomic_init(&(storage->current_time), 0);
-  storage->active = false;
+  atomic_init(&(storage->active), false);
   clock->get_now = rcl_get_ros_time;
   clock->type = RCL_ROS_TIME;
   return RCL_RET_OK;
@@ -306,12 +306,12 @@ rcl_enable_ros_time_override(rcl_clock_t * clock)
   rcl_ros_clock_storage_t * storage = (rcl_ros_clock_storage_t *)clock->data;
   RCL_CHECK_FOR_NULL_WITH_MSG(
     storage, "Clock storage is not initialized, cannot enable override.", return RCL_RET_ERROR);
-  if (!storage->active) {
+  if (!rcutils_atomic_load_bool(&(storage->active))) {
     rcl_time_jump_t time_jump;
     time_jump.delta.nanoseconds = 0;
     time_jump.clock_change = RCL_ROS_TIME_ACTIVATED;
     rcl_clock_call_callbacks(clock, &time_jump, true);
-    storage->active = true;
+    rcutils_atomic_store(&(storage->active), true);
     rcl_clock_call_callbacks(clock, &time_jump, false);
   }
   return RCL_RET_OK;
@@ -328,12 +328,12 @@ rcl_disable_ros_time_override(rcl_clock_t * clock)
   rcl_ros_clock_storage_t * storage = (rcl_ros_clock_storage_t *)clock->data;
   RCL_CHECK_FOR_NULL_WITH_MSG(
     storage, "Clock storage is not initialized, cannot enable override.", return RCL_RET_ERROR);
-  if (storage->active) {
+  if (rcutils_atomic_load_bool(&(storage->active))) {
     rcl_time_jump_t time_jump;
     time_jump.delta.nanoseconds = 0;
     time_jump.clock_change = RCL_ROS_TIME_DEACTIVATED;
     rcl_clock_call_callbacks(clock, &time_jump, true);
-    storage->active = false;
+    rcutils_atomic_store(&(storage->active), false);
     rcl_clock_call_callbacks(clock, &time_jump, false);
   }
   return RCL_RET_OK;
@@ -353,7 +353,7 @@ rcl_is_enabled_ros_time_override(
   rcl_ros_clock_storage_t * storage = (rcl_ros_clock_storage_t *)clock->data;
   RCL_CHECK_FOR_NULL_WITH_MSG(
     storage, "Clock storage is not initialized, cannot enable override.", return RCL_RET_ERROR);
-  *is_enabled = storage->active;
+  *is_enabled = rcutils_atomic_load_bool(&(storage->active));
   return RCL_RET_OK;
 }
 
@@ -371,7 +371,7 @@ rcl_set_ros_time_override(
   RCL_CHECK_FOR_NULL_WITH_MSG(
     storage, "Clock storage is not initialized, cannot enable override.", return RCL_RET_ERROR);
   rcl_time_jump_t time_jump;
-  if (storage->active) {
+  if (rcutils_atomic_load_bool(&(storage->active))) {
     time_jump.clock_change = RCL_ROS_TIME_NO_CHANGE;
     rcl_time_point_value_t current_time;
     rcl_ret_t ret = rcl_get_ros_time(storage, &current_time);

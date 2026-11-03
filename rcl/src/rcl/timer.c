@@ -22,6 +22,7 @@ extern "C"
 #include <inttypes.h>
 
 #include "rcl/error_handling.h"
+#include "rcl/timer_callback_mutex.h"
 #include "rcutils/logging_macros.h"
 #include "rcutils/stdatomic_helper.h"
 #include "rcutils/time.h"
@@ -53,6 +54,10 @@ struct rcl_timer_impl_s
   rcl_allocator_t allocator;
   // The user supplied on reset callback data.
   rcl_timer_on_reset_callback_data_t callback_data;
+  // A callback and its userdata form one transaction. Removal also drains
+  // callbacks already running on another thread before userdata can be freed.
+  rcl_timer_callback_mutex_t callback_mutex;
+  bool callback_mutex_initialized;
 };
 
 rcl_timer_t
@@ -168,7 +173,7 @@ rcl_timer_init2(
   if (now_ret != RCL_RET_OK) {
     return now_ret;  // rcl error state should already be set.
   }
-  rcl_timer_impl_t impl;
+  rcl_timer_impl_t impl = {0};
   impl.clock = clock;
   impl.context = context;
   impl.guard_condition = rcl_get_zero_initialized_guard_condition();
@@ -220,6 +225,15 @@ rcl_timer_init2(
     return RCL_RET_BAD_ALLOC;
   }
   *timer->impl = impl;
+  if (0 != rcl_timer_callback_mutex_init(&timer->impl->callback_mutex)) {
+    // The mutex was never published or initialized. Fini still releases the
+    // guard condition and clock callback created by this constructor.
+    rcl_ret_t fini_ret = rcl_timer_fini(timer);
+    (void)fini_ret;
+    RCL_SET_ERROR_MSG("initializing timer reset callback mutex failed");
+    return RCL_RET_ERROR;
+  }
+  timer->impl->callback_mutex_initialized = true;
   TRACETOOLS_TRACEPOINT(rcl_timer_init, (const void *)timer, period);
   return RCL_RET_OK;
 }
@@ -245,6 +259,9 @@ rcl_timer_fini(rcl_timer_t * timer)
   fail_ret = rcl_guard_condition_fini(&(timer->impl->guard_condition));
   if (RCL_RET_OK != fail_ret) {
     RCL_SET_ERROR_MSG("Failure to fini guard condition");
+  }
+  if (timer->impl->callback_mutex_initialized) {
+    rcl_timer_callback_mutex_fini(&timer->impl->callback_mutex);
   }
   allocator.deallocate(timer->impl, allocator.state);
   timer->impl = NULL;
@@ -481,10 +498,18 @@ rcl_timer_reset(rcl_timer_t * timer)
 
   rcl_timer_on_reset_callback_data_t * cb_data = &timer->impl->callback_data;
 
+  if (0 != rcl_timer_callback_mutex_lock(&timer->impl->callback_mutex)) {
+    RCL_SET_ERROR_MSG("locking timer reset callback mutex failed");
+    return RCL_RET_ERROR;
+  }
   if (cb_data->on_reset_callback) {
     cb_data->on_reset_callback(cb_data->user_data, 1);
   } else {
     cb_data->reset_counter++;
+  }
+  if (0 != rcl_timer_callback_mutex_unlock(&timer->impl->callback_mutex)) {
+    RCL_SET_ERROR_MSG("unlocking timer reset callback mutex failed");
+    return RCL_RET_ERROR;
   }
 
   if (ret != RCL_RET_OK) {
@@ -518,19 +543,31 @@ rcl_timer_set_on_reset_callback(
   const void * user_data)
 {
   RCL_CHECK_ARGUMENT_FOR_NULL(timer, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_FOR_NULL_WITH_MSG(timer->impl, "timer is invalid", return RCL_RET_TIMER_INVALID);
 
   rcl_timer_on_reset_callback_data_t * cb_data = &timer->impl->callback_data;
 
+  if (0 != rcl_timer_callback_mutex_lock(&timer->impl->callback_mutex)) {
+    RCL_SET_ERROR_MSG("locking timer reset callback mutex failed");
+    return RCL_RET_ERROR;
+  }
   if (on_reset_callback) {
     cb_data->on_reset_callback = on_reset_callback;
     cb_data->user_data = user_data;
     if (cb_data->reset_counter) {
-      cb_data->on_reset_callback(user_data, cb_data->reset_counter);
+      const size_t pending_resets = cb_data->reset_counter;
+      // Reentrant callbacks can unregister and reset this timer again. Do not
+      // erase those new pending resets when the old notification returns.
       cb_data->reset_counter = 0;
+      on_reset_callback(user_data, pending_resets);
     }
   } else {
     cb_data->on_reset_callback = NULL;
     cb_data->user_data = NULL;
+  }
+  if (0 != rcl_timer_callback_mutex_unlock(&timer->impl->callback_mutex)) {
+    RCL_SET_ERROR_MSG("unlocking timer reset callback mutex failed");
+    return RCL_RET_ERROR;
   }
 
   return RCL_RET_OK;
